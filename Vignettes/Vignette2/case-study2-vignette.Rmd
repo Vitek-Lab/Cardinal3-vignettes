@@ -1,0 +1,462 @@
+---
+title: 'Case study 2: Large scale single ion segmentation dataset'
+author: "Kylie Ariel Bemis & Melanie Christine Foell"
+date: "November 16, 2022"
+output:
+  BiocStyle::html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE)
+```
+
+# Introduction
+
+In case study 2, we present a highly customized analysis of a 55 GB large dataset consisting of 78 fresh-frozen porcine tissue sections from five organs. The tissues contain regions with different protease activity due to different incubation times for digestion and the application of protease inhibitors. The analysis combines functions unique to Cardinal and basic R methods.
+
+In case Cardinal is not yet installed, download it from Bioconductor as described here. We load the *Cardinal* and *ggplot2* packages, specify a (parallelization-safe) random number generator and specify two colors for the plots we generate later.
+
+```{r packages, results='hide'}
+
+# Install Cardinal if not yet done
+#if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+#BiocManager::install("Cardinal")
+
+library(ggplot2)
+library(scales)
+library(Cardinal)
+RNGkind("L'Ecuyer-CMRG")
+
+blue <- "#0071AA"
+orange <- "#F28016"
+
+```
+
+
+# Data import
+
+First we download the dataset from [PRIDE (PXD011104)](https://www.ebi.ac.uk/pride/archive/projects/PXD011104) to the local computer. 
+Tip: Some internet browsers try to open the imzML file as text file. In this case click on the green button "project ftp" or use this link: https://ftp.pride.ebi.ac.uk/pride/data/archive/2020/08/PXD011104. From there you should be able to download the imzML file correctly. 
+
+Then we import the data into R using Cardinal. Cardinal can handle on disk data via methods from the  [matter Bioconductor R package](https://bioconductor.org/packages/release/bioc/html/matter.html). Thus only a small fraction of the dataset is imported into memory and for each analysis step only the necessary information is loaded into memory, which enables the analysis of large datasets on a normal computer. 
+
+
+```{r read-vis-imzML, warning=FALSE}
+
+mse <- readMSIData("time-curve-dataset.imzML")
+mse
+
+```
+
+With nearly 50,000 features and ~281,000 spectra the data contains 14,063,840,705 (> 14 billions) intensity values. 
+
+# Visualization
+
+To get an overview of the dataset, we plot the ion image of substance P (m/z 1347.7). Substance P was equally sprayed onto all tissues to serve as a substrate that active proteases in the tissues can digest into smaller peptides. We swap the y-axis with ylim in order to have the same orientation as in the original publication.
+
+
+```{r vis-MSI-data}
+
+image(mse, mz=1347.7, plusminus= 0.25, contrast.enhance="histogram", ylim=c(250,0)) 
+
+```
+
+The upper two lines of tissues were not incubated after substance P was applied, thus no digestion was possible there ("no digest"). The lower two lines of tissues were incubated after substance P application in order to allow endogenous tissue proteases to digest it ("digest"). Four spots of protease inhibitor mix were applied onto each tissue to prevent digestion in these confined regions. The six tissue columns represent the six different incubation times: 15min, 30min, 45min, 60min, 120min, 360min (left to right). 
+
+# Mean spectrum calculation
+
+We start by calculating the mean spectrum across all spectra of the dataset, which we will later use for an efficient peak detection. 
+
+```{r calc-mean-time}
+
+matter::profmem({
+
+	mse_mean <- summarizeFeatures(mse, FUN="mean")
+
+})
+
+```
+
+In our case the calculation of the mean spectrum of all 281395 spectra took about ~1200 seconds and ~9 GB of memory. Both values will vary slightly between runs and especially between different hardware.
+
+To show the benefit of parallel computation, we repeat the calculation and use 2 cores instead of 1. On Windows we use *SnowParam()*, while on Linux/Mac *MulticoreParam()* can be used instead.
+
+```{r calc-mean-time-2workers}
+
+matter::profmem({
+
+	mse_mean <- summarizeFeatures(mse, FUN="mean", BPPARAM=MulticoreParam(workers=2)) # SnowParam() on Windows; MultiParam() on Linux/Mac
+	
+})
+
+```
+
+Indeed with 2 cores the calculation took only about ~700 seconds. 
+
+Next we plot the mean spectrum.
+
+```{r vis-mean}
+
+plot(mse_mean)
+
+```
+
+In the following plot we zoom into the mass range of substance P (mz 1347.7).
+
+```{r vis-zoomed-plot}
+
+mse_mean %>%
+	subsetFeatures(mz >= 1347, mz <= 1350) %>%
+	plot(main="Substance P - 1347.7 m/z")
+
+```
+
+# Preprocessing
+
+Pre-processing is necessary to clean up the data before statistical analysis. The peak detection step drastically reduces the size of the data. We perform peak picking, peak alignment, and peak filtering on the mean spectrum to showcase an efficient method for the pre-processing of very large datasets.
+
+As a result we obtain a global peaklist which contains all picked m/z values. To obtain the intensities at the respective m/z positions in each spectrum we use the `peakBin()` function on the TIC normalized dataset. At each m/z position listed in the peaklist, the `peakBin()` function extracts the peak area of each TIC normalized spectrum and stores it as intensity value for the respective m/z value. 
+
+
+```{r preprocessing}
+
+matter::profmem({
+
+	ref <- mse_mean %>%
+		peakPick(method="mad", SNR=5) %>%
+		peakAlign() %>%
+		peakFilter() %>%
+		process()
+
+	mse_peaks <- mse %>%
+		normalize(method="tic") %>%
+		peakBin(ref=mz(ref),
+				tolerance=100,
+				units="ppm") %>%
+		process()
+
+})
+
+# size of dataset after pre-processing
+imageData(mse_peaks)
+
+
+```
+
+The main pre-processing took about ~1000 seconds, consumed a maximum of ~10 GB of memory and generated a dataset of ~230 MB size.
+
+
+# Selection of tissues of interest
+
+First we swap the y coordinates in the dataset in order to have the image in the same orientation as in the original publication. 
+
+```{r fix-coordinates}
+
+coord(mse_peaks)$y <- max(coord(mse_peaks)$y) - coord(mse_peaks)$y + 1
+
+```
+
+Then we plot the ion image of substance P (mz 1347.7) and find the coordinates that separate the different time points and incubation types.  
+
+```{r select-conditions}
+
+image(mse_peaks, mz=1347.7, plusminus = 0.25, 
+	contrast.enhance="histogram",
+	smooth.image="adaptive")
+abline(v=c(268, 558, 846, 1166, 1468), col="red")
+abline(h=140, col="red")
+
+```
+
+After swapping the y-axis, we annotate the spectra according to "no digest" (upper part of image) and "digest" (lower part of image) and the different digestion incubation times, which are increasing from left to right. 
+
+```{r select-times}
+
+# generation of logical vectors for each set of tissues 
+no_digest <- coord(mse_peaks)$y < 140
+digest <- coord(mse_peaks)$y >= 140
+
+t_15 <- coord(mse_peaks)$x <= 268
+t_30 <- coord(mse_peaks)$x > 268 & coord(mse_peaks)$x <= 558
+t_45 <- coord(mse_peaks)$x > 558 & coord(mse_peaks)$x <= 846
+t_60 <- coord(mse_peaks)$x > 846 & coord(mse_peaks)$x <= 1166
+t_120 <- coord(mse_peaks)$x > 1166 & coord(mse_peaks)$x <= 1468
+t_360 <- coord(mse_peaks)$x > 1468
+
+# transforming logical vectors into factors
+condition <- makeFactor("digest"=digest, "no_digest"=no_digest)
+time <- makeFactor("15_min"=t_15, "30_min"=t_30, "45_min"=t_45,
+	"60_min"=t_60, "120_min"=t_120, "360_min"=t_360)
+
+# combining condition and time into one factor
+cond_time <- paste0(condition, "_", time)
+cond_time <- factor(cond_time, levels=unique(cond_time))
+
+# combining all metadata into one dataframe
+mse_pdata <- data.frame(run(mse_peaks), coord(mse_peaks), cond_time, condition, time)
+head(mse_pdata)
+
+
+```
+
+Each combination of time point and digestion state contains several individual tissues. We manually selected the different tissue types (kidney, pancreas, liver, muscle, spleen) in the substance P ion image with the `selectROI()` function. To avoid this interactive step in the vignette, we provide the saved annotated regions as new columns in the metadata dataframe [spectral_metadata.txt](https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.RMSV000000664/2022-06-21_MCFoell_174a6708/metadata/spectral_metadata.txt&forceDownload=true). Next, we summarize the number of spectra per tissue type. 
+
+```{r load-ROIs}
+
+# load metadata
+mse_pdata <- read.table("spectral_metadata.txt", header=TRUE)
+head(mse_pdata)
+
+# Count number of spectra per tissue type
+table(mse_pdata$tissue)
+
+```
+
+After reading in the metadata file, we need to change each column into a factor. Then, we attach the metadata directly to the spectra in the MSI dataset. 
+
+```{r ROI annotation}
+
+# convert tissue types,condition and cond_time into factors
+mse_pdata$tissue <- factor(mse_pdata$tissue,
+	levels=c("kidney", "pancreas", "liver", "muscle", "spleen"))
+
+mse_pdata$cond_time <- factor(mse_pdata$cond_time,
+	levels=unique(mse_pdata$cond_time))
+
+mse_pdata$condition <- factor(mse_pdata$condition, levels=unique(mse_pdata$condition))
+
+mse_pdata$time <- factor(mse_pdata$time,
+	levels=c("15_min", "30_min", "45_min", "60_min", "120_min", "360_min")) 
+
+# attach metadata factors to MSI data
+pData(mse_peaks)$tissue <- mse_pdata$tissue
+pData(mse_peaks)$cond_time <- mse_pdata$cond_time
+pData(mse_peaks)$condition <- mse_pdata$condition
+pData(mse_peaks)$time <- mse_pdata$time
+
+```
+
+# Single ion segmentation to find areas with and without protease inhibitors
+
+For our further analysis, we will focus on the spleen tissue. Thus, we filter to keep only spectra annotated as spleen. Then we subset the MSI data for four m/z ions that belong to substance P (m/z 1347.7) and its digested peptides (m/z 753.4, 900.5, 1104.6). In concordance with the publication by Erich et al., we remove the 45 min time point as it does not give additional value.
+
+```{r preparation-spatial-DGMM}
+
+# keep only pixels labelled as tissue type "spleen"
+mse_spleen <- subsetPixels(mse_peaks, tissue == "spleen")
+mse_spleen <- subsetPixels(mse_spleen, time != "45_min")
+mse_spleen$time <- droplevels(mse_spleen$time) # remove 45_min level from factor
+
+# keep only m/z values of interest. 
+mse_spleen <- subsetFeatures(mse_spleen, mz=c(753.4, 900.5, 1104.6, 1347.7))
+# save subset file to enable later re-start from here
+save(mse_spleen, file="mse_spleen.RData")
+
+# subset MSI data further into "digest" and "no digest" spleen tissues
+mse_spleen_digest <- subsetPixels(mse_spleen, condition == "digest")
+mse_spleen_no_digest <- subsetPixels(mse_spleen, condition == "no_digest")
+
+# visualization of time in digested spleen dataset
+image(mse_spleen_digest, time ~ x * y, ylim=c(0,200))
+legend("topright", horiz=TRUE, legend=c(levels(mse_spleen_digest$time)), 
+      fill=hue_pal()(5), cex=0.8)
+
+```
+
+The positions of the protease inhibitor mix spots were unfortunately not provided with the raw data. To obtain information about which spectra were likely treated with protease inhibitor mix and which not, we'll use a special segmentation method. Single ion segmentation is a method uniquely provided by Cardinal. The method behind is called spatially-aware Dirichlet Gaussian mixture models ([spatial-DGMM](https://pubmed.ncbi.nlm.nih.gov/31510675)), which segments each mass feature individually, rather than the dataset as a whole .
+
+Here, we use it to segment the four m/z features for which we have already filtered the spleen dataset. The intensity differences between the intact substance P peptide and its digested peptides should show pronounced differences in areas with and without protease inhibitor mix. In this way we will obtain the spatial distribution of the applied protease inhibitor mix.
+
+We run spatial DGMM only on the "digest" part of the dataset, in which we want to compare difference between areas with digestion and with inhibited digestion due to the protease inhibitor spots. Thus, we aim to obtain two clusters in every tissue. Therefore, we set number of clusters k to 2. We keep the spatial radius (r) to its default value 1. Each of the six spleen tissues was incubated for different times. Therefore, we use the time factor as a grouping factor which will generate a separate DGMM analysis on each tissue. After DGMM, we save the result data and summarize the DGMM results.
+
+
+```{r spatial-DGMM}
+
+# DGMM analysis
+set.seed(1)
+dgmm_spleen <- spatialDGMM(mse_spleen_digest, annealing=FALSE,
+	r=1, k=2, groups=pData(mse_spleen_digest)$time)
+
+
+# saving results file for later re-use
+save(dgmm_spleen, file="dgmm_spleen.RData")
+
+# summary of DGMM analysis
+summary(dgmm_spleen)
+
+```
+
+The first three features obtain less than two classes per tissue, while feature number four results in two classes (clusters) per tissue. The fourth feature was substance P (1347.7).
+
+First we plot the ion images of substance P in the digested spleen as a comparison. Then we plot the DGMM results for substance P.
+
+```{r substance-P-image}
+
+# extract m/z value of interest to use for image plotting
+substance_p <- 4 
+mzid <- round(mz(mse_spleen)[substance_p], 2)
+
+# ion images of m/z 1357.81 with contrast enhancement and image smoothing
+setup.layout(c(1,5), top=0, left=-2, right=1, xaxt="n", yaxt="n", bty="n")
+image(mse_spleen, mz=mzid, subset=(cond_time == "digest_15_min"), main="15 min",
+	contrast.enhance="suppression", smooth.image="gaussian", layout=NULL,
+	xlab="", ylab="", strip=FALSE, colorkey=list(yaxt="s", cex.axis=1))
+image(mse_spleen, mz=mzid, subset=(cond_time == "digest_30_min"), main="30 min",
+	contrast.enhance="suppression", smooth.image="gaussian", layout=NULL,
+	xlab="", ylab="", strip=FALSE, colorkey=list(yaxt="s", cex.axis=1))
+image(mse_spleen, mz=mzid, subset=(cond_time == "digest_60_min"), main="60 min",
+	contrast.enhance="suppression", smooth.image="gaussian", layout=NULL,
+	xlab="", ylab="", strip=FALSE, colorkey=list(yaxt="s", cex.axis=1))
+image(mse_spleen, mz=mzid, subset=(cond_time == "digest_120_min"), main="120 min",
+	contrast.enhance="suppression", smooth.image="gaussian", layout=NULL,
+	xlab="", ylab="", strip=FALSE, colorkey=list(yaxt="s", cex.axis=1))
+image(mse_spleen, mz=mzid, subset=(cond_time == "digest_360_min"), main="360 min",
+	contrast.enhance="suppression", smooth.image="gaussian", layout=NULL,
+	xlab="", ylab="", strip=FALSE, colorkey=list(yaxt="s", cex.axis=1))
+
+```
+	
+DGMM clusters per tissue for substance P: 
+
+```{r vis-substance-P-dgmm}
+
+# visualization of DGMM results
+setup.layout(c(1,5), top=0, left=-2, right=1, xaxt="n", yaxt="n", bty="n")
+
+#images of the two clusters in each tissue (= at each time point) 
+image(dgmm_spleen, values="class", model=list(feature=substance_p),
+	column=1:2, subset=time == "15_min", layout=NULL, main="15 min",
+	xlab="", ylab="", strip=FALSE, key=FALSE, col=c(blue, orange))
+legend("topright", legend=c("Inhibitor", "No inhibitor"),
+	fill=c(orange, blue), bg=rgb(1, 1, 1, 0.75))
+image(dgmm_spleen, values="class", model=list(feature=substance_p),
+	column=3:4, subset=time == "30_min", layout=NULL, main="30 min",
+	xlab="", ylab="", strip=FALSE, key=FALSE, col=c(blue, orange))
+legend("topright", legend=c("Inhibitor", "No inhibitor"),
+	fill=c(orange, blue), bg=rgb(1, 1, 1, 0.75))
+image(dgmm_spleen, values="class", model=list(feature=substance_p),
+	column=5:6, subset=time == "60_min", layout=NULL, main="60 min",
+	xlab="", ylab="", strip=FALSE, key=FALSE, col=c(blue, orange))
+legend("topright", legend=c("Inhibitor", "No inhibitor"),
+	fill=c(orange, blue), bg=rgb(1, 1, 1, 0.75))
+image(dgmm_spleen, values="class", model=list(feature=substance_p),
+	column=7:8, subset=time == "120_min", layout=NULL, main="120 min",
+	xlab="", ylab="", strip=FALSE, key=FALSE, col=c(blue, orange))
+legend("topright", legend=c("Inhibitor", "No inhibitor"),
+	fill=c(orange, blue), bg=rgb(1, 1, 1, 0.75))
+image(dgmm_spleen, values="class", model=list(feature=substance_p),
+	column=9:10, subset=time == "360_min", layout=NULL, main="360 min",
+	xlab="", ylab="", strip=FALSE, key=FALSE, col=c(blue, orange))
+legend("topright", legend=c("Inhibitor", "No inhibitor"),
+	fill=c(orange, blue), bg=rgb(1, 1, 1, 0.75))
+
+```
+
+
+We can extract further information from the DGMM result such as mean intensity of substance P per cluster and the intensity variation within each cluster. 
+
+```{r substance-P-dgmm-result}
+
+substance_p <- 4 # m/z 1347
+
+dgmm_data <- resultData(dgmm_spleen, substance_p, "estimates")
+dgmm_data
+
+
+```
+
+For an easier interpretation, we can plot the mean substance P intensity per cluster. 
+
+
+```{r vis-DGMM-barplot}
+
+barplot(dgmm_data$mean, main ="mean intensity per class", names.arg =dgmm_data$group, las=2)
+
+```
+
+Indeed, for substance P each tissue was separated into two clusters with very different mean intensity values, indicating that the clusters might correspond to digested (low substance p) and not digested (high substance P) spectra. The difference between these two clusters raises with incubation times until 60 min and then decreases again, likely due to reduced stability over time of the inhibitor mix. 
+
+The DGMM result table does not contain information about which cluster corresponds to "digest" and "no digest". We will thus assign the obtained 10 clusters accordingly into these two categories and add this information to the DGMM results table. 
+
+```{r substance-P-curve-preparation}
+
+# automatic assignment of higher mean values to inhibitor class
+dgmm_inhibitor_cl <- tapply(resultData(dgmm_spleen, substance_p, "class"),
+	INDEX=pData(dgmm_spleen)$time,
+	FUN=function(cl) {
+		ci <- sort(unique(as.integer(cl)))
+		m <- resultData(dgmm_spleen, substance_p, "estimates")$mean[ci]
+		ci[which.max(m)]
+	})
+
+# automatic assignment of lower mean values to no inhibitor class
+dgmm_no_inhibitor_cl <- tapply(resultData(dgmm_spleen, substance_p, "class"),
+	INDEX=pData(dgmm_spleen)$time,
+	FUN=function(cl) {
+		ci <- sort(unique(as.integer(cl)))
+		m <- resultData(dgmm_spleen, substance_p, "estimates")$mean[ci]
+		ci[which.min(m)]
+	})
+
+#  new column with factor for treatment (inhibitor and no inhibitor) in DGMM result table
+dgmm_data$trt <- makeFactor(inhibitor=dgmm_data$class %in% dgmm_inhibitor_cl,
+	no_inhibitor=dgmm_data$class %in% dgmm_no_inhibitor_cl)
+dgmm_data
+
+```
+
+Next, we calculate the intensity ratio for substance P in "digest" versus "no digest" tissues at the five incubation times. "Digest" refers to the DGMM cluster without inhibitor ("no inhibitor). Similarly to the original publication, the "no digest" tissues that were never incubated and thus not digested are used for normalization. The substance P intensities for the "digest" spectra and all spectra of the "no digest" are averaged separately for each tissue (time point). Then the ratio between both conditions is calculated.  
+
+```{r substance-P-curve-preparationII}
+
+# calculate substance P average intensities on "no digest" spleen tissues (for normalization)
+# first we summarize the spectra of the not digested spleens into the 5 time points, then we extract the mean intensities for substance P for each tissue (time point)
+norm_spleen <- summarizeFeatures(mse_spleen_no_digest, groups=mse_spleen_no_digest$time)
+norm_spleen <- spectra(norm_spleen) 
+norm_spleen <- setNames(norm_spleen[substance_p,], levels(mse_spleen_no_digest$time)) 
+
+
+spleen_ratio <- spectra(mse_spleen_digest)[substance_p,] / norm_spleen[mse_spleen_digest$time]
+dgmm_data$logratio <- tapply(log2(spleen_ratio+0.01), resultData(dgmm_spleen, substance_p, "class"), mean)
+dgmm_data$s2logratio <- tapply(log2(spleen_ratio+0.01), resultData(dgmm_spleen, substance_p, "class"), var)
+dgmm_data
+
+```
+
+Then, we log2 transform the substance P intensity ratios and convert the times into numeric values.
+
+```{r substance-P-curve-preparationIII}
+
+# extract numeric values from time names
+dgmm_data$time <- sapply(strsplit(as.character(dgmm_data$group), "_"),
+	function(x) as.numeric(x[1]))
+
+# convert treatment (trt) into a factor
+dgmm_data$trt <- makeFactor(inhibitor=dgmm_data$class %in% dgmm_inhibitor_cl,
+	no_inhibitor=dgmm_data$class %in% dgmm_no_inhibitor_cl)
+
+```
+
+And finally, we plot the log2 intensity ratio for substance P over the incubation time points with the standard deviation as error margin. 
+
+```{r substance-P-curve}
+
+ggplot(dgmm_data, aes(x=time, y=logratio, color=trt)) + 
+	labs(title="Substance P presence is modulated by protease inhibitor mix",
+		x="Incubation Time (min)", y="Log Intensity Ratio (digest / no-digest)") +
+	scale_color_manual(name="Treatment",
+		values=c(orange, blue), labels=c("Inhibitor", "No inhibitor")) +
+	geom_errorbar(aes(ymin=logratio-sqrt(s2logratio), ymax=logratio+sqrt(s2logratio))) +
+	geom_point() + geom_line() + theme_minimal()
+
+
+```
+
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

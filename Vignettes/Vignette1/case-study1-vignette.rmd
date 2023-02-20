@@ -1,0 +1,334 @@
+---
+title: 'Case study1: High resolution segmentation dataset'
+author: "Kylie Ariel Bemis & Melanie Christine Foell"
+date: "November 14, 2022"
+output:
+  BiocStyle::html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE)
+```
+
+# Introduction
+
+In case study 1, we present pre-processing and unsupervised segmentation analysis on a high-mass resolution dataset from phospholipid imaging of a mouse urinary bladder tissue. The dataset is publicly available via [PRIDE](https://www.ebi.ac.uk/pride/archive/projects/PXD001283) and [MassIVE](https://massive.ucsd.edu/ProteoSAFe/dataset.jsp?task=117f527a97e3401baec21ecf050c6f99). 
+ 
+
+We reproduce some figures from the associate publication, to which we'll refer to as "original publication" throughout this vignette:
+
+Roempp A, Guenther S, Schober Y, Schulz O, Takats Z, Kummer W, Spengler B; Histology by mass spectrometry: label-free tissue characterization obtained from high-accuracy bioanalytical imaging., Angew Chem Int Ed Engl, 2010 May 17, 49, 22, 3834-8, PMID: [20397170](http://europepmc.org/abstract/MED/20397170)
+
+First we load the *Cardinal* package and specify a (parallelization-safe) random number generator (RNG). The latter ensures reproducibility, even in case the code is changed to turn on parallelism.
+
+
+```{r}
+
+library(Cardinal)
+RNGkind("L'Ecuyer-CMRG")
+
+```
+
+# Data import
+
+To get started we download the imzML file (.imzML and .ibd files) from [PRIDE](https://www.ebi.ac.uk/pride/archive/projects/PXD001283) or [MassIVE](https://massive.ucsd.edu/ProteoSAFe/dataset.jsp?task=117f527a97e3401baec21ecf050c6f99) into the folder of our current working directory (which can be found by using getwd()). Alternatively, we could specify the file path in the 'readMSIData' function. 
+
+We import the data using 10 ppm to bin the m/z values while reading this processed type of imzML file, which contains a different m/z axis for each spectrum [Schramm et al.](https://doi.org/10.1016/j.jprot.2012.07.026). The m/z binning is necessary to make m/z values of different spectra comparable. Thus we set the resolution for m/z binning to a value that represents the positions where the actual m/z datapoints are. This value has to be adjusted based on the mass accuracy and resolution of the used mass spectrometer. 
+
+```{r read-imzML}
+getwd() # find working directory, copy imzML file into this folder or specify the path in the next line
+mse <- readMSIData("HR2MSI mouse urinary bladder S096.imzML", mass.range=c(400,1000), resolution=10, units="ppm")
+mse
+
+```
+
+The dataset has more than 90,000 m/z values and more than 34,000 mass spectra. 
+
+# Mean spectrum
+
+As a first step, we calculate and plot the mean spectrum across all spectra, which will be used for an efficient peak picking later on.
+
+
+```{r calcmean}
+
+mse_mean <- summarizeFeatures(mse, FUN="mean")
+plot(mse_mean)
+
+```
+
+Let's zoom in on two peaks shown in Fig. 2C of the original publication, which are only 0.05 *mz* apart.
+
+
+```{r vis-zoomed-mean}
+
+mse_mean %>%
+	subsetFeatures(mz >= 770.4, mz <= 770.7) %>%
+	plot()
+
+```
+
+Both peaks are visible in the mean spectrum.
+
+
+# Pre-processing
+
+Pre-processing is performed to clean up the spectra e.g. remove mass and intensity shifts before statistical analysis. 
+
+We use the previously calculated mean spectrum for peak picking and then align the picked peaks with a tolerance of 15 ppm between all spectra. The tolerance for alignment has to be slightly larger than the tolerance for reading the raw data to account for slight shifts in the m/z dimension, while still being small enough to prevent alignment of different peaks. Thus we have chosen 15 ppm. Next, we keep only peaks that occur in 1% of all spectra and have non zero mean intensities. The 1% cutoff is commonly used in MSI data analysis based on the assumption that peaks that have an intensity above zero in less than 1% of spectra are either noise or not containing enough information for statistical analysis. 
+
+```{r preprocessing-peaklist, message=FALSE}
+
+ref <- mse_mean %>%
+	peakPick(method="mad",
+			SNR=6) %>%
+	peakAlign("mean",
+			tolerance=15,
+			units="ppm") %>%
+	peakFilter() %>%
+	process()
+ref
+
+```
+
+Now we bin the peaks in the full dataset to the reference peaks we detected in the mean spectrum. This is done by integrating the peak areas at the m/z positions defined in the peaklist on all TIC normalized spectra. Even for peaks that did not make the peak picking cutoff criteria in an individual spectra, their area under the curve is integrated instead of setting their intensity to zero. Thus the peakBin function removes inaccuracies of the peak detection step and leads to a dataset with only few zero intensity values.  
+
+```{r preprocessing-peak-binning}
+
+mse_peaks <- mse %>%
+	normalize(method="tic") %>%
+	peakBin(ref=mz(ref),
+			tolerance=15,
+			units="ppm") %>%
+	process()
+
+
+```
+
+We save the peaklist, mean spectrum and the preprocessed data. Optionally we could load the MSI data again with the readMSIData function.
+
+```{r preprocessing-export, warning=FALSE}
+
+write.table(fData(mse_peaks),  "mouse-bladder-peaks.tsv")
+
+writeMSIData(mse_peaks, "mouse-bladder-peaks.imzML")
+
+save(mse_mean, file="mouse-bladder-mean.RData")
+
+# mse_peaks <- readMSIData("mouse-bladder-peaks.imzML")
+
+```
+
+We visualize the two very close peaks (From Figure 2C of the original publication) to control that they were detected as separate peaks during peak picking. 
+
+
+```{r vis-sep-peaks-spectra}
+
+mz(ref)[mz(ref) >= 770.4 & mz(ref) <= 770.7]
+
+mse_mean %>%
+	subsetFeatures(mz >= 770.4, mz <= 770.7) %>%
+	plot(main="Separated peaks at 770.5088 and 770.5606")
+abline(v=mz(ref), col="red", lty=2)
+
+```
+
+The red line indicates that indeed both peaks were detected during peak picking.
+
+
+# Visualizations
+
+Below, we plot ion images for these two close peaks at *mz* 770.51 and 770.56.
+
+
+```{r vis-sep-peaks-ionimages}
+
+image(mse_peaks, mz=c(770.51, 770.56),
+	contrast.enhance="suppress",
+	smooth.image="adaptive",
+	normalize.image="linear",
+	layout=c(2,1))
+
+```
+
+Then we overlay both *mz* features into one plot. 
+
+```{r vis-sep-peaks-overlay}
+
+setup.layout(c(1,1))
+image(mse_peaks, mz=c(770.51, 770.56),
+	main="Separated peaks at 770.5088 and 770.5606",
+	col=c("green", "red"),
+	contrast.enhance="suppress",
+	smooth.image="adaptive",
+	normalize.image="linear",
+	superpose=TRUE)
+
+```
+
+We notice that these images are the reverse of figure 2B in the original publication, suggesting that these two peaks were mislabeled in the publication. The color-coding in figure S5 from the supporting information of the original publication suggests that this may be the case.
+
+
+Next, we plot an overlay ion image of three *mz* features with different distributions in the tissue to reproduce Fig. 1A from the original publication.
+
+
+```{r vis-three-peaks-overlay}
+
+setup.layout(c(1,1))
+image(mse_peaks, mz=c(798.5410, 741.5307, 743.5482),
+		main="Mouse urinary bladder",
+		col=c("green", "blue", "red"),
+		contrast.enhance="suppress",
+		smooth.image="adaptive",
+		normalize.image="linear",
+		superpose=TRUE)
+
+```
+
+Our visualization looks very similar to the published figure.
+
+
+# Segmentation
+
+After successful pre-processing and visualization, we continue with statistical analysis, which was not done in the original publication.
+
+We fit unsupervised spatial shrunken centroids to segment the data into tissue segments with distinct molecular composition. This spatially aware unsupervised segmentation method is specifically built for the spatial structure of mass spectrometry imaging data. 
+
+```{r segmentation}
+
+set.seed(1)
+ssc1 <- spatialShrunkenCentroids(mse_peaks,
+			r=2, s=c(0,6,12,18,24,30), k=10,
+			method="gaussian")
+
+summary(ssc1)
+
+```
+
+Then we visualize the results. 
+
+```{r vis-segmentation}
+
+image(ssc1, model=list(s=c(0,6,12,18,24,30)), key=FALSE, col=discrete.colors(10))
+
+```
+
+We can see that the background takes up several segments, showing a left-to-right gradient across the slide. The same gradient is also visible in the two cluster of the muscle layer at lower s. 
+
+When `s = 24, most tissue structures are separated: urothelium, muscle, adventitita, while the three other clusters represent the background. 
+
+Thus we plot this clustering (s=24) separately again and assign colours that better distinguish the clusters. 
+
+```{r vis-s-24}
+
+cols1 = c("#9FBEAC", "#008E87","#0074B0","#DE4D6C", "#F99D1D",  "#C2B03B")
+
+image(ssc1, model=list(s=24), col=cols1)
+
+
+```
+
+We select cluster 3 (muscle), 4 (urothelium) and 6 (adventitia) as tissue specific clusters and visualize only those. 
+
+```{r vis-s-24-clusters}
+
+set.seed(1)
+tissue_clusters = c(3,4,6)
+image(ssc1, model=list(s=24), column=tissue_clusters,col=cols1[tissue_clusters])
+
+```
+
+We can differentiate the muscle layer (blue, 3), the adventitial layer (yellow, 6), and the urothelium (red, 4).
+
+Next, we plot the three tissue clusters separately as well as the ion images of the m/z values that contributed most to each cluster (highest t-statistic value). Unsupervised spatial shrunken centroids performs feature regularization and thus reports m/z features that define the segments. The higher the t-statistics value, the more the m/z feature contributed to the segment.
+
+```{r vis-s-24-clusters-separate}
+
+setup.layout(c(3,3))
+image(ssc1, model=list(s=24), key=TRUE, strip=TRUE, layout=FALSE,
+      column=tissue_clusters[1], col=cols1[tissue_clusters[1]])
+image(ssc1, model=list(s=24), key=TRUE, strip=TRUE, layout=FALSE,
+      column=tissue_clusters[2], col=cols1[tissue_clusters[2]])
+image(ssc1, model=list(s=24), key=TRUE, strip=TRUE, layout=FALSE,
+      column=tissue_clusters[3], col=cols1[tissue_clusters[3]])
+
+plot(ssc1, values="statistic", model=list(s=24), key=TRUE, strip=TRUE, layout=FALSE,
+     column=tissue_clusters[1], col=cols1[tissue_clusters[1]])
+plot(ssc1, values="statistic", model=list(s=24), key=TRUE, strip=TRUE, layout=FALSE,
+     column=tissue_clusters[2], col=cols1[tissue_clusters[2]])
+plot(ssc1, values="statistic", model=list(s=24), key=TRUE, strip=TRUE, layout=FALSE,
+     column=tissue_clusters[3], col=cols1[tissue_clusters[3]])
+
+image(mse_peaks, mz=topFeatures(ssc1, model=list(s=24), class==tissue_clusters[1])$mz[1],
+      strip=TRUE, layout=FALSE)
+image(mse_peaks, mz=topFeatures(ssc1, model=list(s=24), class==tissue_clusters[2])$mz[1],
+      strip=TRUE, layout=FALSE)
+image(mse_peaks, mz=topFeatures(ssc1, model=list(s=24), class==tissue_clusters[3])$mz[1],
+      strip=TRUE, layout=FALSE)
+
+```
+
+
+Below, we plot the t-statistics that show the over/under-abundance of analytes in each of these segments relative to the mean spectrum.
+
+```{r plot-features}
+plot(ssc1, values="statistic", model=list(s=24), column=tissue_clusters, lwd=2, col=cols1[tissue_clusters])
+```
+
+Among these segment specific m/z features are many m/z that were described in the original publication as tissue specific: m/z 741.5307 and 770.5698 in the muscle cluster (blue), and m/z 770.5097, 798.5410 and 812.5566 in the urothelium cluster (red). However, in addition our analysis revealed many more tissue specific m/z features
+
+# Colocalization of lamina propria m/z feature
+
+With the segmentation analysis, we found a segment that describes the adventitial layer that was not described in the original publication. However, segmentation did not find a segment that corresponded to the lamina propria, which in the original publication was visualized via the m/z value 743.5448. We use this m/z value as a reference and perform a colocalization analysis, to find m/z with a similar tissue distribution. 
+
+```{r colocalization}
+
+mse_lp <- colocalized(mse_peaks, mz=743.5482)
+mse_lp
+
+```
+
+The correlation values are all comparably low. To confirm this result, we visualize the reference m/z and the three best correlating m/z values next to each other. 
+
+```{r vis-colocalization}
+
+image(mse_peaks, mz=mse_lp$mz[1:4],
+	contrast.enhance="histogram",
+	smooth.image="adaptive",
+	normalize.image="linear")
+
+
+```
+
+Indeed, the other m/z features are present in the lamina propria but not as exclusively as the reference m/z. Therefore, the multivariate segmentation method, which focuses on clusters described by multiple m/z values was not able to find the lamina propria segment.   
+
+
+# Export and save results
+
+To finish, we export and save the results of our analysis. 
+
+We extract the top *mz* features for each tissue cluster and save them as separate tab-separated files. 
+
+```{r export-features}
+
+for ( sid in tissue_clusters ) {
+  print(sid)
+  topmz <- subset(topFeatures(ssc1, model=list(s=24), class==sid & statistic > 0, n=Inf))
+  write.table(topmz[order(topmz$mz),], paste0("mouse-ssc1-topmz-c", sid, ".tsv"))
+}
+```
+
+Finally, we save the segmentatin results as RData file for potential re-use without having to run all calculations again. 
+
+```{r save-segmentation-result}
+
+save(ssc1, file="mouse-bladder-results.RData")
+
+```
+
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
